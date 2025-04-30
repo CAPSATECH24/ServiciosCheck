@@ -1,7 +1,8 @@
+# -*- coding: utf-8 -*-
 import streamlit as st
 import pandas as pd
 import io
-from datetime import date
+from datetime import date, datetime, time # Asegúrate de importar time
 import numpy as np
 
 # --- Configuración de la página ---
@@ -21,19 +22,24 @@ st.markdown(
 st.markdown("Carga tu archivo CSV, configura los filtros y presiona **'Buscar Resultados'**.")
 
 # --- Estado de Sesión ---
-if 'search_triggered' not in st.session_state: st.session_state.search_triggered = False
-if 'expand_all_details' not in st.session_state: st.session_state.expand_all_details = False
-if 'data_loaded' not in st.session_state: st.session_state.data_loaded = False
-if 'loaded_df' not in st.session_state: st.session_state.loaded_df = pd.DataFrame()
-if 'unique_clients' not in st.session_state: st.session_state.unique_clients = []
-if 'unique_executives' not in st.session_state: st.session_state.unique_executives = []
-if 'min_date' not in st.session_state: st.session_state.min_date = None
-if 'max_date' not in st.session_state: st.session_state.max_date = None
-if 'last_uploaded_filename' not in st.session_state: st.session_state.last_uploaded_filename = None
-if 'selected_client_on_search' not in st.session_state: st.session_state.selected_client_on_search = "Todos"
-if 'selected_executive_on_search' not in st.session_state: st.session_state.selected_executive_on_search = "Todos"
-if 'date_range_on_search' not in st.session_state: st.session_state.date_range_on_search = (None, None)
-
+# Initialize session state variables if they don't exist
+default_values = {
+    'search_triggered': False,
+    'expand_all_details': False,
+    'data_loaded': False,
+    'loaded_df': pd.DataFrame(),
+    'unique_clients': [],
+    'unique_executives': [],
+    'min_date': None,
+    'max_date': None, # Guardará la fecha máxima encontrada en el CSV
+    'last_uploaded_filename': None,
+    'selected_client_on_search': "Todos",
+    'selected_executive_on_search': "Todos",
+    'date_range_on_search': (None, None) # Guarda el rango de la última búsqueda
+}
+for key, value in default_values.items():
+    if key not in st.session_state:
+        st.session_state[key] = value
 
 # --- Función de Estilo para Colorear Texto ---
 def highlight_status(row):
@@ -43,7 +49,8 @@ def highlight_status(row):
     default_color = ''
     status_column = 'Avance Cotización'
     style = [default_color] * len(row)
-    if status_column in row:
+    # Check if the status column exists in the row's index (safer than checking row directly)
+    if status_column in row.index:
         status_value = str(row[status_column]).lower()
         if 'garantia' in status_value or 'garantía' in status_value :
             style = [color_texto_garantia] * len(row)
@@ -59,10 +66,20 @@ uploaded_file = st.file_uploader("📂 1. Carga tu archivo CSV", type=["csv"])
 # Procesar el archivo SOLO si es nuevo o no se ha cargado antes
 if uploaded_file is not None:
     is_new_file = (st.session_state.last_uploaded_filename != uploaded_file.name)
-    if is_new_file:
+    # Process if it's a new file OR if data wasn't successfully loaded last time
+    if is_new_file or not st.session_state.data_loaded:
         st.session_state.last_uploaded_filename = uploaded_file.name
+        # Reset states related to data processing
         st.session_state.data_loaded = False
         st.session_state.search_triggered = False
+        st.session_state.min_date = None
+        st.session_state.max_date = None # Reset max_date for the new file
+        st.session_state.unique_clients = []
+        st.session_state.unique_executives = []
+        st.session_state.loaded_df = pd.DataFrame()
+        # Resetea el rango de búsqueda guardado al cargar nuevo archivo
+        st.session_state.date_range_on_search = (None, None)
+
 
         with st.spinner("Procesando archivo..."):
             try:
@@ -71,8 +88,12 @@ if uploaded_file is not None:
                     stringio = io.StringIO(uploaded_file.getvalue().decode('utf-8'))
                     df_raw = pd.read_csv(stringio)
                 except UnicodeDecodeError:
+                    st.info("Error con UTF-8, intentando con Latin-1...")
                     stringio = io.StringIO(uploaded_file.getvalue().decode('latin1'))
                     df_raw = pd.read_csv(stringio)
+                except Exception as e_read:
+                     st.error(f"Error al leer el CSV: {e_read}. Asegúrate de que sea un CSV válido.")
+                     st.stop()
 
                 # --- Data Cleaning and Preparation ---
                 client_col_name = 'CLIENTES SATECH'
@@ -80,193 +101,249 @@ if uploaded_file is not None:
                 executive_col_name = 'EJECUTIVO'
                 status_col_name = 'Avance Cotización'
                 col_to_split = 'DESCRIPTION'
-
                 final_display_columns = [
                     'FECHA', 'Avance Cotización', 'Folio Cotización', 'UNIDAD MARINE',
                     'IMEI REAL', 'TECNICO', 'EJECUTIVO', 'CONCEPTO', 'TICKET NOTION'
                 ]
-
-                client_col_cleaned = 'CLIENTE_NOMBRE' # Columna interna para nombre limpio
+                client_col_cleaned = 'CLIENTE_NOMBRE'
                 date_col_cleaned = 'FECHA_DT'
                 date_col_display = 'Fecha_Solo'
-
                 df = df_raw.copy()
 
-                # Verificar columnas esenciales
+                # --- Column Validation (sin cambios) ---
                 required_processing_cols = set(final_display_columns) | {client_col_name, date_col_name, executive_col_name, status_col_name}
-                if 'CONCEPTO' not in df.columns and col_to_split not in df.columns:
+                has_concepto = 'CONCEPTO' in df.columns
+                has_description = col_to_split in df.columns
+                if not has_concepto and not has_description:
                     st.error(f"Se necesita la columna 'CONCEPTO' o la columna '{col_to_split}' para generarla.")
                     st.stop()
-                elif 'CONCEPTO' not in df.columns:
+                elif not has_concepto:
                     required_processing_cols.add(col_to_split)
-
-                if executive_col_name not in df.columns:
-                    st.error(f"Falta la columna '{executive_col_name}' en el archivo.")
+                essential_cols = {client_col_name, date_col_name, executive_col_name, status_col_name}
+                missing_essential = essential_cols - set(df.columns)
+                if missing_essential:
+                    st.error(f"Faltan columnas esenciales en el archivo: {missing_essential}")
                     st.stop()
-                if status_col_name not in df.columns:
-                    st.error(f"Falta la columna '{status_col_name}' necesaria para colorear y calcular porcentajes.")
-                    st.stop()
+                missing_display = set(final_display_columns) - set(df.columns)
+                if not has_concepto and col_to_split in df.columns:
+                    missing_display.discard('CONCEPTO')
+                if missing_display:
+                       st.warning(f"Faltan algunas columnas que se usan para mostrar resultados: {missing_display}. Se mostrarán las columnas disponibles.")
+                       final_display_columns = [col for col in final_display_columns if col in df.columns or (col == 'CONCEPTO' and not has_concepto)]
 
-                missing_cols = required_processing_cols - set(df.columns)
-                if missing_cols:
-                    missing_display = missing_cols - {'CONCEPTO'} if 'CONCEPTO' not in df_raw.columns else missing_cols
-                    if missing_display:
-                        st.error(f"Faltan columnas esenciales en el archivo: {missing_display}")
-                        st.stop()
-
-                # Generar CONCEPTO si no existe
-                if 'CONCEPTO' not in df.columns:
+                # --- Data Transformation (sin cambios) ---
+                if not has_concepto and has_description:
                     st.info(f"Generando 'CONCEPTO' desde '{col_to_split}'...")
-                    df[col_to_split] = df[col_to_split].astype(str)
+                    df[col_to_split] = df[col_to_split].fillna('').astype(str)
                     split_cols = df[col_to_split].str.split(':', n=1, expand=True)
                     df['CONCEPTO'] = split_cols[0].str.strip()
+                    if 'CONCEPTO' not in missing_display and 'CONCEPTO' not in final_display_columns:
+                        try:
+                            idx = final_display_columns.index('EJECUTIVO')
+                            final_display_columns.insert(idx + 1, 'CONCEPTO')
+                        except ValueError:
+                            final_display_columns.append('CONCEPTO')
                     st.success(f"Columna 'CONCEPTO' generada.")
 
-                # Limpieza de cliente (crea CLIENTE_NOMBRE)
-                df[client_col_cleaned] = df[client_col_name].astype(str).str.split('(', expand=True)[0].str.strip()
-                df[client_col_cleaned] = df[client_col_cleaned].fillna(df[client_col_name].astype(str).str.strip()) # Usar original si split falla
-                st.session_state.unique_clients = sorted(df[client_col_cleaned].dropna().unique())
+                df[client_col_name] = df[client_col_name].fillna('Desconocido').astype(str)
+                df[client_col_cleaned] = df[client_col_name].str.split('(', n=1, expand=True)[0].str.strip()
+                df[client_col_cleaned] = df[client_col_cleaned].replace('', 'Desconocido')
+                df.loc[df[client_col_name] == 'Desconocido', client_col_cleaned] = 'Desconocido'
+                st.session_state.unique_clients = sorted(df[client_col_cleaned].unique())
 
-                # Limpieza y obtención de ejecutivos únicos
                 df[executive_col_name] = df[executive_col_name].fillna('').astype(str).str.strip()
-                st.session_state.unique_executives = sorted(df[executive_col_name].replace('', np.nan).dropna().unique())
+                st.session_state.unique_executives = sorted(df[executive_col_name][df[executive_col_name] != ''].unique())
 
-                # Conversión de fecha
+                # --- Date Processing (sin cambios) ---
+                st.info(f"Procesando columna de fecha: '{date_col_name}'...")
                 df[date_col_cleaned] = pd.to_datetime(df[date_col_name], errors='coerce', infer_datetime_format=True)
-                if df[date_col_cleaned].isnull().all():
-                    st.error("No se pudo convertir la columna 'FECHA'. Verifica el formato.")
-                    st.stop()
-                elif df[date_col_cleaned].isnull().any():
-                    st.warning("Algunas fechas no pudieron ser convertidas.")
+                invalid_date_count = df[date_col_cleaned].isnull().sum()
+                if invalid_date_count > 0:
+                    st.warning(f"{invalid_date_count} fechas no pudieron ser convertidas y serán ignoradas en filtros y agrupaciones.")
+                df[date_col_display] = df[date_col_cleaned].dt.date
+                valid_dates = df[date_col_display].dropna()
+                if not valid_dates.empty:
+                    st.session_state.min_date = valid_dates.min()
+                    st.session_state.max_date = valid_dates.max() # Guarda la fecha máxima real
+                    st.info(f"Rango de fechas detectado: {st.session_state.min_date} a {st.session_state.max_date}")
+                else:
+                    st.error("No se encontraron fechas válidas en la columna 'FECHA'. No se pueden establecer filtros de fecha.")
+                    st.session_state.min_date = date.today()
+                    st.session_state.max_date = date.today()
 
-                df_valid_dates = df.dropna(subset=[date_col_cleaned])
-                if df_valid_dates.empty:
-                    st.error("No hay fechas válidas en la columna 'FECHA'.")
-                    st.stop()
-                df[date_col_display] = df_valid_dates[date_col_cleaned].dt.date
-                st.session_state.min_date = df[date_col_display].min()
-                st.session_state.max_date = df[date_col_display].max()
-
-                # Llenar NAs en columnas relevantes
+                # Fill NAs (sin cambios)
                 cols_to_fill_na = [status_col_name, 'TICKET NOTION', 'Folio Cotización', 'TECNICO', 'UNIDAD MARINE', 'IMEI REAL', 'CONCEPTO']
                 for col in cols_to_fill_na:
                     if col in df.columns:
                         df[col] = df[col].fillna('')
 
+                # Store the processed DataFrame
                 st.session_state.loaded_df = df
                 st.session_state.data_loaded = True
-                st.success(f"Archivo '{uploaded_file.name}' procesado.")
+                st.success(f"Archivo '{uploaded_file.name}' procesado exitosamente.")
 
             except Exception as e:
-                st.error(f"Error al procesar el archivo: {e}")
+                st.error(f"Error inesperado al procesar el archivo: {e}")
                 st.session_state.data_loaded = False
                 st.session_state.loaded_df = pd.DataFrame()
+                st.exception(e)
                 st.stop()
-            st.rerun()
 
-# Mostrar filtros solo si los datos se cargaron correctamente
+        st.rerun()
+
+# --- UI Elements (Only if data is loaded) ---
 if st.session_state.data_loaded:
     df_loaded = st.session_state.loaded_df
     final_display_columns = [
         'FECHA', 'Avance Cotización', 'Folio Cotización', 'UNIDAD MARINE',
         'IMEI REAL', 'TECNICO', 'EJECUTIVO', 'CONCEPTO', 'TICKET NOTION'
     ]
+    final_display_columns = [col for col in final_display_columns if col in df_loaded.columns]
     client_col_name = 'CLIENTES SATECH'
     executive_col_name = 'EJECUTIVO'
     status_col_name = 'Avance Cotización'
-    client_col_cleaned = 'CLIENTE_NOMBRE' # Nombre limpio para filtros y agrupación
+    client_col_cleaned = 'CLIENTE_NOMBRE'
+    date_col_display = 'Fecha_Solo'
 
-    # --- Streamlit UI Elements (Sidebar) ---
+
+    # --- Sidebar Filters ---
     st.sidebar.header("⚙️ 2. Filtros")
 
+    # Selectores de Cliente y Ejecutivo (sin cambios)
     selected_client = st.sidebar.selectbox(
         "👥 Selecciona un Cliente",
         options=["Todos"] + st.session_state.unique_clients,
+        index=0 if st.session_state.selected_client_on_search == "Todos" else (st.session_state.unique_clients.index(st.session_state.selected_client_on_search) + 1 if st.session_state.selected_client_on_search in st.session_state.unique_clients else 0),
         key="client_selector"
     )
-
     selected_executive = st.sidebar.selectbox(
         "🧑‍💼 Selecciona un Ejecutivo",
         options=["Todos"] + st.session_state.unique_executives,
+        index=0 if st.session_state.selected_executive_on_search == "Todos" else (st.session_state.unique_executives.index(st.session_state.selected_executive_on_search) + 1 if st.session_state.selected_executive_on_search in st.session_state.unique_executives else 0),
         key="executive_selector"
     )
 
     st.sidebar.subheader("📅 Rango de Fechas")
-    min_date_obj = st.session_state.min_date if isinstance(st.session_state.min_date, date) else date.min
-    max_date_obj = st.session_state.max_date if isinstance(st.session_state.max_date, date) else date.max
-    default_start = min_date_obj if min_date_obj else date.today()
-    default_end = max_date_obj if max_date_obj else date.today()
-    if default_start > default_end: default_start = default_end
+    # --- Robust Date Input Setup ---
+    min_val_dt = st.session_state.min_date if isinstance(st.session_state.min_date, date) else date.today()
+    max_val_dt = st.session_state.max_date if isinstance(st.session_state.max_date, date) else date.today()
 
+    if min_val_dt > max_val_dt:
+        st.warning(f"La fecha mínima ({min_val_dt}) en los datos es posterior a la máxima ({max_val_dt}). Usando {max_val_dt} como rango.")
+        min_val_dt = max_val_dt
+
+    # --- MODIFICACIÓN CLAVE: Lógica para valores por defecto del date_input ---
+    last_start, last_end = st.session_state.date_range_on_search
+    last_start_valid = isinstance(last_start, date)
+    last_end_valid = isinstance(last_end, date)
+
+    # Si hay un rango válido de una búsqueda anterior, usarlo.
+    if last_start_valid and last_end_valid:
+        default_start = last_start
+        default_end = last_end
+    # Si NO hay rango de búsqueda anterior (carga inicial o nuevo archivo):
+    # Establecer AMBOS valores por defecto a la fecha MÁXIMA (más reciente).
+    else:
+        default_start = max_val_dt # <--- CAMBIO
+        default_end = max_val_dt   # <--- CAMBIO
+    # --- FIN MODIFICACIÓN ---
+
+    # Asegurar que los valores por defecto estén dentro de los límites del widget
+    # (Importante si se usó un rango de búsqueda anterior que ahora está fuera de los límites del nuevo archivo)
+    default_start = max(default_start, min_val_dt) # No puede ser menor que la mínima global
+    default_start = min(default_start, max_val_dt) # No puede ser mayor que la máxima global
+    default_end = max(default_end, min_val_dt)   # No puede ser menor que la mínima global
+    default_end = min(default_end, max_val_dt)   # No puede ser mayor que la máxima global
+
+    # Asegurar que start <= end (aunque con la nueva lógica rara vez será necesario)
+    if default_start > default_end:
+         default_start = default_end # Opcional: ajustar si algo sale mal
+
+    # El widget date_input
     date_range = st.sidebar.date_input(
         "Selecciona el rango",
+        # value ahora será (max_date, max_date) por defecto tras cargar archivo
         value=(default_start, default_end),
-        min_value=min_date_obj,
-        max_value=max_date_obj,
+        min_value=min_val_dt, # El límite inferior sigue siendo la fecha más antigua
+        max_value=max_val_dt, # El límite superior sigue siendo la fecha más reciente
         key="date_range_selector"
     )
+    # --- End Robust Date Input Setup ---
 
-    # --- Botón de Búsqueda ---
+    # --- Search Button (sin cambios) ---
     st.sidebar.markdown("---")
     if st.sidebar.button("🚀 Buscar Resultados", key="search_button", type="primary"):
         st.session_state.search_triggered = True
         st.session_state.selected_client_on_search = selected_client
         st.session_state.selected_executive_on_search = selected_executive
-        st.session_state.date_range_on_search = date_range
-        st.session_state.expand_all_details = False
+        if len(date_range) == 2:
+            # Guarda el rango *seleccionado* por el usuario para esta búsqueda
+            st.session_state.date_range_on_search = date_range
+        else:
+            st.warning("Rango de fechas inválido seleccionado. Usando el rango completo de datos.")
+            st.session_state.date_range_on_search = (st.session_state.min_date, st.session_state.max_date)
 
-    # --- Display Results (Conditional) ---
+        st.session_state.expand_all_details = False
+        st.rerun()
+
+    # --- Display Results (sin cambios en el resto del código) ---
     st.markdown("---")
     st.header("📊 3. Resultados")
 
     if st.session_state.search_triggered:
+        # --- Código de filtrado y visualización sin cambios ---
         client_to_filter = st.session_state.selected_client_on_search
         executive_to_filter = st.session_state.selected_executive_on_search
         date_range_to_filter = st.session_state.date_range_on_search
-
-        if len(date_range_to_filter) == 2:
-            start_date, end_date = date_range_to_filter
-        else:
-            start_date = st.session_state.min_date
-            end_date = st.session_state.max_date
-            st.warning("Rango de fechas inválido, mostrando todos los datos dentro de los otros filtros.")
 
         # --- Filtering Logic ---
         filtered_df = df_loaded.copy()
 
         if client_to_filter != "Todos":
-            # Filtrar usando la columna de nombre limpio
             filtered_df = filtered_df[filtered_df[client_col_cleaned] == client_to_filter]
-
         if executive_to_filter != "Todos":
             filtered_df = filtered_df[filtered_df[executive_col_name] == executive_to_filter]
 
-        if start_date and end_date:
-            if not isinstance(start_date, date): start_date = pd.to_datetime(start_date).date()
-            if not isinstance(end_date, date): end_date = pd.to_datetime(end_date).date()
+        if len(date_range_to_filter) == 2 and date_range_to_filter[0] is not None and date_range_to_filter[1] is not None:
+            start_date, end_date = date_range_to_filter
+            if not isinstance(start_date, date): start_date = datetime.combine(start_date, time.min).date()
+            if not isinstance(end_date, date): end_date = datetime.combine(end_date, time.min).date()
 
-            filtered_df['Fecha_Solo'] = pd.to_datetime(filtered_df['Fecha_Solo'], errors='coerce').dt.date
-            filtered_df = filtered_df.dropna(subset=['Fecha_Solo'])
+            if date_col_display in filtered_df:
+                try:
+                    filtered_df[date_col_display] = pd.to_datetime(filtered_df[date_col_display], errors='coerce').dt.date
+                    filtered_df_dated = filtered_df.dropna(subset=[date_col_display])
+                    if not filtered_df_dated.empty:
+                         filtered_df = filtered_df_dated[
+                             (filtered_df_dated[date_col_display] >= start_date) &
+                             (filtered_df_dated[date_col_display] <= end_date)
+                         ]
+                    else:
+                         filtered_df = pd.DataFrame(columns=filtered_df.columns)
+                except Exception as e_date_filter:
+                    st.error(f"Error al convertir o filtrar fechas: {e_date_filter}")
+                    filtered_df = pd.DataFrame(columns=filtered_df.columns)
+            else:
+                st.warning(f"La columna de fecha '{date_col_display}' no está disponible para filtrar.")
+        else:
+            st.warning("No se aplicó filtro de fecha porque el rango seleccionado o guardado era inválido.")
 
-            filtered_df = filtered_df[
-                (filtered_df['Fecha_Solo'] >= start_date) &
-                (filtered_df['Fecha_Solo'] <= end_date)
-            ]
-        elif start_date or end_date:
-             st.warning("Se requiere seleccionar una fecha de inicio y fin para filtrar por rango.")
-
-        # --- Display Grouped Results ---
+        # --- Display Grouped Results (sin cambios) ---
         if filtered_df.empty:
             st.warning("No hay datos que coincidan con los filtros seleccionados.")
         else:
-            # --- Mostrar grupos por fecha/cliente (sin cambios) ---
+            st.write(f"Mostrando {len(filtered_df)} registros filtrados.")
             try:
-                if 'Fecha_Solo' in filtered_df.columns:
-                    grouped = filtered_df.sort_values(by=['Fecha_Solo', client_col_cleaned])\
-                                         .groupby(['Fecha_Solo', client_col_cleaned], sort=False, dropna=False)
+                if date_col_display in filtered_df.columns and client_col_cleaned in filtered_df.columns:
+                    try:
+                        filtered_df[date_col_display] = pd.to_datetime(filtered_df[date_col_display], errors='coerce').dt.date
+                    except: pass
+
+                    grouped = filtered_df.sort_values(by=[date_col_display, client_col_cleaned])\
+                                     .groupby([date_col_display, client_col_cleaned], sort=False, dropna=False)
+
                     num_groups = len(grouped)
-                    total_rows_filtered = len(filtered_df)
-                    st.write(f"Mostrando {total_rows_filtered} registros en {num_groups} grupo(s) de Fecha/Cliente:")
+                    st.write(f"Agrupados por Fecha/Cliente en {num_groups} grupo(s):")
 
                     col_btn1, col_btn2, _ = st.columns([1, 1, 5])
                     def set_expand_all(value): st.session_state.expand_all_details = value
@@ -274,52 +351,51 @@ if st.session_state.data_loaded:
                     with col_btn2: st.button("➖ Contraer Todo", key="btn_collapse", on_click=set_expand_all, args=(False,))
 
                     for (date_val, client_name_val), group in grouped:
-                        # Usar el nombre original del cliente para la etiqueta del expander si está disponible
                         client_display_name_orig = group[client_col_name].iloc[0] if not group.empty and client_col_name in group and pd.notna(group[client_col_name].iloc[0]) else client_name_val
-                        date_str = date_val.strftime('%Y-%m-%d') if pd.notna(date_val) else "Fecha Desconocida"
-                        expander_label = f"🗓️ {date_str} - 👤 {client_display_name_orig}"
+                        date_str = date_val.strftime('%Y-%m-%d') if pd.notna(date_val) and isinstance(date_val, date) else "Fecha Desconocida"
+                        expander_label = f"🗓️ {date_str} - 👤 {client_display_name_orig} ({len(group)} registros)"
 
                         with st.expander(expander_label, expanded=st.session_state.expand_all_details):
                             existing_final_cols = [col for col in final_display_columns if col in group.columns]
                             display_group_df = group[existing_final_cols].reset_index(drop=True).copy()
-                            display_group_df.fillna('', inplace=True)
                             if 'FECHA' in display_group_df.columns:
-                                 display_group_df['FECHA'] = pd.to_datetime(display_group_df['FECHA'], errors='coerce').dt.strftime('%Y-%m-%d')
-                                 display_group_df['FECHA'] = display_group_df['FECHA'].fillna('')
+                                display_group_df['FECHA'] = pd.to_datetime(display_group_df['FECHA'], errors='coerce').dt.strftime('%Y-%m-%d')
+                                display_group_df['FECHA'] = display_group_df['FECHA'].fillna('Inválida')
+                            display_group_df.fillna('', inplace=True)
                             styled_group_df = display_group_df.style.apply(highlight_status, axis=1)
                             st.dataframe(styled_group_df, hide_index=True, use_container_width=True)
                 else:
-                    st.error("La columna 'Fecha_Solo' necesaria para agrupar no se pudo generar correctamente.")
-            except Exception as e:
-                st.error(f"Ocurrió un error al intentar agrupar y mostrar los resultados: {e}")
-                st.exception(e)
+                    st.error(f"No se pueden agrupar los resultados. Faltan las columnas '{date_col_display}' o '{client_col_cleaned}'.")
+            except Exception as e_group:
+                st.error(f"Ocurrió un error al intentar agrupar y mostrar los resultados: {e_group}")
+                st.exception(e_group)
 
-            # --- Tabla Completa Filtrada (Opcional) ---
+            # --- Optional: Full Filtered Table (sin cambios) ---
             st.markdown("---")
             with st.expander("Ver tabla completa filtrada (columnas seleccionadas)", expanded=False):
-                 try:
-                     existing_final_cols_full = [col for col in final_display_columns if col in filtered_df.columns]
-                     full_display_df = filtered_df[existing_final_cols_full].copy()
-                     full_display_df.fillna('', inplace=True)
-                     if 'FECHA' in full_display_df.columns:
+                try:
+                    existing_final_cols_full = [col for col in final_display_columns if col in filtered_df.columns]
+                    full_display_df = filtered_df[existing_final_cols_full].copy()
+                    if 'FECHA' in full_display_df.columns:
                          full_display_df['FECHA'] = pd.to_datetime(full_display_df['FECHA'], errors='coerce').dt.strftime('%Y-%m-%d')
-                         full_display_df['FECHA'] = full_display_df['FECHA'].fillna('')
-                     styled_full_df = full_display_df.style.apply(highlight_status, axis=1)
-                     st.dataframe(styled_full_df, hide_index=True, use_container_width=True)
-                 except Exception as e_table:
-                     st.error(f"Error al mostrar la tabla completa: {e_table}")
+                         full_display_df['FECHA'] = full_display_df['FECHA'].fillna('Inválida')
+                    full_display_df.fillna('', inplace=True)
+                    styled_full_df = full_display_df.style.apply(highlight_status, axis=1)
+                    st.dataframe(styled_full_df, hide_index=True, use_container_width=True)
+                except Exception as e_table:
+                    st.error(f"Error al mostrar la tabla completa: {e_table}")
 
-            # --- SECCIÓN: Resumen General y por Cliente ---
+            # --- Summary Section (sin cambios) ---
             st.markdown("---")
             st.subheader("📈 Resumen de Avance (Cotizado vs Garantía)")
+            # (El código del resumen permanece igual)
             try:
-                if status_col_name in filtered_df:
-                    # --- Resumen General (sin cambios) ---
+                if status_col_name in filtered_df.columns:
+                    # --- Overall Summary ---
                     status_series = filtered_df[status_col_name].astype(str).str.lower()
                     count_cotizado_total = status_series.str.contains('cotiza', na=False).sum()
                     count_garantia_total = status_series.str.contains('garantía|garantia', na=False, regex=True).sum()
                     total_relevant_total = count_cotizado_total + count_garantia_total
-
                     if total_relevant_total > 0:
                         perc_cotizado_total = (count_cotizado_total / total_relevant_total) * 100
                         perc_garantia_total = (count_garantia_total / total_relevant_total) * 100
@@ -330,83 +406,42 @@ if st.session_state.data_loaded:
                         with col2:
                             st.metric(label="Garantía (General)", value=f"{perc_garantia_total:.1f}%", delta=f"{count_garantia_total} registros", delta_color="off")
                     else:
-                        st.info("No se encontraron registros generales 'Cotizado' o 'Garantía' para calcular porcentajes.")
+                        st.info("No se encontraron registros generales 'Cotizado' o 'Garantía' en los datos filtrados para calcular porcentajes.")
 
-                    # --- NUEVO: Desglose por Cliente ---
+                    # --- Breakdown by Client ---
                     st.markdown("---")
                     st.markdown("#### Desglose por Cliente")
-
-                    # Agrupar por el nombre limpio del cliente
                     client_summary = filtered_df.groupby(client_col_cleaned).agg(
-                        Total_Registros=(status_col_name, 'size'), # Contar total por cliente
                         Cotizado_Count=(status_col_name, lambda x: x.astype(str).str.lower().str.contains('cotiza', na=False).sum()),
                         Garantia_Count=(status_col_name, lambda x: x.astype(str).str.lower().str.contains('garantía|garantia', na=False, regex=True).sum())
-                    ).reset_index() # Convertir índice (cliente) a columna
-
-                    # Calcular total relevante y porcentajes por cliente
+                    ).reset_index()
                     client_summary['Total_Relevante'] = client_summary['Cotizado_Count'] + client_summary['Garantia_Count']
-                    client_summary['Cotizado_%'] = client_summary.apply(
-                        lambda row: (row['Cotizado_Count'] / row['Total_Relevante'] * 100) if row['Total_Relevante'] > 0 else 0, axis=1
-                    )
-                    client_summary['Garantia_%'] = client_summary.apply(
-                        lambda row: (row['Garantia_Count'] / row['Total_Relevante'] * 100) if row['Total_Relevante'] > 0 else 0, axis=1
-                    )
-
-                    # Seleccionar y renombrar columnas para mostrar
-                    summary_display = client_summary[[
-                        client_col_cleaned, 'Cotizado_Count', 'Garantia_Count', 'Total_Relevante', 'Cotizado_%', 'Garantia_%'
-                    ]].rename(columns={
-                        client_col_cleaned: 'Cliente',
-                        'Cotizado_Count': 'Cotizados (#)',
-                        'Garantia_Count': 'Garantías (#)',
-                        'Total_Relevante': 'Total C+G',
-                        'Cotizado_%': 'Cotizado (%)',
-                        'Garantia_%': 'Garantía (%)'
-                    })
-
-                    # Mostrar tabla de desglose
+                    client_summary['Cotizado_%'] = np.where(client_summary['Total_Relevante'] > 0,(client_summary['Cotizado_Count'] / client_summary['Total_Relevante'] * 100),0)
+                    client_summary['Garantia_%'] = np.where(client_summary['Total_Relevante'] > 0,(client_summary['Garantia_Count'] / client_summary['Total_Relevante'] * 100),0)
+                    summary_filtered = client_summary[client_summary['Total_Relevante'] > 0].copy()
+                    summary_display = summary_filtered[[client_col_cleaned, 'Cotizado_Count', 'Garantia_Count', 'Total_Relevante', 'Cotizado_%', 'Garantia_%']].rename(columns={client_col_cleaned: 'Cliente','Cotizado_Count': 'Cotizados (#)','Garantia_Count': 'Garantías (#)','Total_Relevante': 'Total C+G','Cotizado_%': 'Cotizado (%)','Garantia_%': 'Garantía (%)'})
                     if not summary_display.empty:
-                        st.dataframe(
-                            summary_display.style.format({
-                                'Cotizado (%)': '{:.1f}%',
-                                'Garantía (%)': '{:.1f}%'
-                            }),
-                            hide_index=True,
-                            use_container_width=True
-                        )
-
-                        # --- NUEVO: Gráfico por Cliente ---
+                        st.dataframe(summary_display.style.format({'Cotizado (%)': '{:.1f}%','Garantía (%)': '{:.1f}%'}),hide_index=True,use_container_width=True)
+                        # --- Bar Chart by Client ---
                         st.markdown("#### Visualización por Cliente (Cantidad)")
-                        # Preparar datos para el gráfico (solo conteos)
-                        chart_data = client_summary[[client_col_cleaned, 'Cotizado_Count', 'Garantia_Count']].rename(columns={
-                            client_col_cleaned: 'Cliente',
-                            'Cotizado_Count': 'Cotizado',
-                            'Garantia_Count': 'Garantía'
-                        }).set_index('Cliente') # Cliente como índice para st.bar_chart
-
-                        # Filtrar clientes con al menos un registro relevante para el gráfico
-                        chart_data_filtered = chart_data[chart_data.sum(axis=1) > 0]
-
-                        if not chart_data_filtered.empty:
-                           st.bar_chart(chart_data_filtered)
+                        chart_data = summary_display.set_index('Cliente')[['Cotizados (#)', 'Garantías (#)']].rename(columns={'Cotizados (#)': 'Cotizado','Garantías (#)': 'Garantía'})
+                        if not chart_data.empty:
+                            st.bar_chart(chart_data)
                         else:
-                           st.info("No hay datos suficientes por cliente para generar el gráfico.")
-
+                            st.info("No hay datos por cliente para generar el gráfico.")
                     else:
-                        st.info("No se encontraron datos por cliente para generar el desglose.")
-
-
+                        st.info("No se encontraron datos por cliente con 'Cotizado' o 'Garantía' para generar el desglose.")
                 else:
                     st.warning(f"La columna '{status_col_name}' no se encontró en los datos filtrados para calcular el resumen.")
-
             except Exception as e_summary:
                 st.error(f"Error al calcular el resumen de avance: {e_summary}")
                 st.exception(e_summary)
-            # --- FIN SECCIÓN ---
+            # --- End Summary Section ---
 
+    # Mensaje si no se ha buscado
     elif st.session_state.data_loaded and not st.session_state.search_triggered:
         st.info("👆 Configura los filtros en la barra lateral y presiona 'Buscar Resultados'.")
 
+# Mensaje si no hay archivo
 elif not uploaded_file:
     st.info("Por favor, carga un archivo CSV para comenzar el análisis.")
-
